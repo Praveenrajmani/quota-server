@@ -1,10 +1,8 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -12,56 +10,16 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/gorilla/mux"
 	"github.com/minio/minio-go/v7"
 )
 
-const (
-	retentionDays = 10
-	maxLimit      = 10
-)
-
-var (
-	internalError = errors.New("internal error")
-	requestError  = errors.New("invalid request")
-)
-
-type UserQuota struct {
-	Objects  map[string]int `json:"objects"`
-	MaxLimit int            `json:"maxLimit,omitempty"`
-}
-
-func NewUserQuota() *UserQuota {
-	return &UserQuota{
-		Objects:  make(map[string]int),
-		MaxLimit: maxLimit,
-	}
-}
-
-func parseUserQuota(r io.Reader) (*UserQuota, error) {
-	var quota UserQuota
-	if err := json.NewDecoder(r).Decode(&quota); err != nil {
-		return nil, err
-	}
-	return &quota, nil
-}
-
-func (quota UserQuota) Write(w io.Writer) error {
-	encoder := json.NewEncoder(w)
-	return encoder.Encode(quota)
-}
-
-func readUserQuota(ctx context.Context, user string) (*UserQuota, error) {
-	reader, err := s3Client.GetObject(ctx, "manifests", user+".quota", minio.GetObjectOptions{})
-	if err != nil {
-		return nil, err
-	}
-	defer reader.Close()
-	return parseUserQuota(reader)
-}
-
-// const shortForm = "2006-Jan-02"
-// 	t, _ := time.Parse(shortForm, "2024-Feb-21")
-
+// POST /quota/update
+//
+// - Parse the incoming MinIO bucket notification PUT event of the file voicemails/DATE/USER/object
+// - Reads the corresponding user quota of the user
+// - If the quota is not present, will add a new quota file - `manifests/USER.quota` and adds the object path to the quota
+// - If quota is present, will append the path to the quota objects list
 func updateQuotaHandler(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -99,15 +57,13 @@ func updateQuotaHandler(w http.ResponseWriter, r *http.Request) {
 	if bucket == "" || object == "" {
 		return
 	}
-	fmt.Println(bucket)
+
 	path, err := url.PathUnescape(object)
 	if err != nil {
 		fmt.Println("\n[ERROR] unable to escape the path %v; %v", object, err)
 		http.Error(w, "unable to escape the object path", http.StatusBadRequest)
 		return
 	}
-	fmt.Println(path)
-	// 2021-Feb-20/usera/voice1.vm
 
 	tokens := strings.Split(path, "/")
 	if len(tokens) < 3 {
@@ -115,8 +71,11 @@ func updateQuotaHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user := tokens[1]
-	var userQuota *UserQuota
 
+	lock(user)
+	defer unlock(user)
+
+	var userQuota *UserQuota
 	userQuota, err = readUserQuota(context.Background(), user)
 	if err != nil {
 		if minio.ToErrorResponse(err).Code != "NoSuchKey" {
@@ -124,25 +83,88 @@ func updateQuotaHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "manifest file cannot be read", http.StatusBadRequest)
 			return
 		}
-		fmt.Println("creating new")
 		userQuota = NewUserQuota()
+		userQuota.Objects[path] = 1
 	} else {
+		userQuota.Refresh()
 		if _, ok := userQuota.Objects[path]; ok {
+			userQuota.Objects[path]++
+		} else {
+			userQuota.Objects[path] = 1
+		}
+	}
+
+	if len(userQuota.Objects) >= userQuota.MaxLimit {
+		http.Error(w, "max limit exceeded", http.StatusForbidden)
+		return
+	}
+
+	if err := updateUserQuota(context.Background(), user, userQuota); err != nil {
+		fmt.Printf("unable to update user quota for user %v; %v\n", user, err)
+		http.Error(w, "unable to update user quota", http.StatusBadRequest)
+	}
+}
+
+// GET /quota/check/{user}
+//
+// - Reads the quota of the provided user
+// - Refreshes the quota
+// - Checks if it exceeds the max limit
+func quotaCheckHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	user := vars["user"]
+
+	lock(user)
+	defer unlock(user)
+
+	userQuota, err := readUserQuota(context.Background(), user)
+	if err != nil {
+		if minio.ToErrorResponse(err).Code != "NoSuchKey" {
+			// new user
+			return
+		}
+		http.Error(w, "unable to GET user quota", http.StatusInternalServerError)
+		return
+	}
+	userQuota.Refresh()
+
+	if len(userQuota.Objects) >= userQuota.MaxLimit {
+		http.Error(w, "max limit exceeded", http.StatusForbidden)
+	}
+}
+
+// GET /quota/refresh
+//
+// - Lists the user quotas from MinIO
+// - Refreshes the user quota
+// - PUTs the updated user quota back to MinIO
+func quotaRefreshHandler(w http.ResponseWriter, r *http.Request) {
+	refreshUserQuota := func(user string) error {
+		lock(user)
+		defer unlock(user)
+
+		userQuota, err := readUserQuota(context.Background(), user)
+		if err != nil {
+			return fmt.Errorf("unable to read user quota for user %v; %v\n", user, err)
+		}
+		if userQuota.Refresh() {
+			if err := updateUserQuota(context.Background(), user, userQuota); err != nil {
+				return fmt.Errorf("unable to update user quota for user %v; %v\n", user, err)
+			}
+		}
+		return nil
+	}
+	for object := range s3Client.ListObjects(context.Background(), manifestsBucket, minio.ListObjectsOptions{}) {
+		if object.Err != nil {
+			http.Error(w, fmt.Sprintf("unable to list objects; %v", object.Err), http.StatusInternalServerError)
+			return
+		}
+		user := strings.TrimSuffix(object.Key, quotaExt)
+		if err := refreshUserQuota(user); err != nil {
+			fmt.Println(err.Error())
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 	}
-	userQuota.Objects[path] = retentionDays
-
-	var buf bytes.Buffer
-	if err := userQuota.Write(&buf); err != nil {
-		http.Error(w, "unable to write user quota", http.StatusInternalServerError)
-		return
-	}
-	info, err := s3Client.PutObject(context.Background(), "manifests", user+".quota", bytes.NewReader(buf.Bytes()), int64(buf.Len()), minio.PutObjectOptions{ContentType: "application/octet-stream"})
-	if err != nil {
-		fmt.Printf("unable to PUT userquota for user %v; %v", user, err)
-		http.Error(w, "unable to PUT user quota", http.StatusInternalServerError)
-		return
-	}
-	fmt.Println(info)
+	return
 }

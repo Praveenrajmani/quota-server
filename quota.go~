@@ -1,0 +1,89 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"strings"
+	"time"
+
+	"github.com/minio/minio-go/v7"
+)
+
+const (
+	maxLimit   = 10
+	dateFormat = "2006-Jan-02"
+)
+
+type UserQuota struct {
+	Objects  map[string]int `json:"objects"`
+	MaxLimit int            `json:"maxLimit,omitempty"`
+}
+
+func NewUserQuota() *UserQuota {
+	return &UserQuota{
+		Objects:  make(map[string]int),
+		MaxLimit: maxLimit,
+	}
+}
+
+func (quota *UserQuota) Refresh() (updated bool) {
+	objects := map[string]int{}
+	for object, version := range quota.Objects {
+		tokens := strings.Split(object, "/")
+		if len(tokens) < 3 {
+			updated = true
+			continue
+		}
+		date := tokens[0]
+		t, err := time.Parse(dateFormat, date)
+		if err != nil {
+			updated = true
+			continue
+		}
+		if time.Now().After(t) {
+			updated = true
+			continue
+		}
+		objects[object] = version
+	}
+	quota.Objects = objects
+	return
+}
+
+func parseUserQuota(r io.Reader) (*UserQuota, error) {
+	var quota UserQuota
+	if err := json.NewDecoder(r).Decode(&quota); err != nil {
+		return nil, err
+	}
+	return &quota, nil
+}
+
+func (quota UserQuota) Write(w io.Writer) error {
+	encoder := json.NewEncoder(w)
+	return encoder.Encode(quota)
+}
+
+func readUserQuota(ctx context.Context, user string) (*UserQuota, error) {
+	reader, err := s3Client.GetObject(ctx, "manifests", user+".quota", minio.GetObjectOptions{})
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+	return parseUserQuota(reader)
+}
+
+func updateUserQuota(ctx context.Context, user string, userQuota *UserQuota) error {
+	var buf bytes.Buffer
+	if err := userQuota.Write(&buf); err != nil {
+		return err
+	}
+	info, err := s3Client.PutObject(context.Background(), "manifests", user+".quota", bytes.NewReader(buf.Bytes()), int64(buf.Len()), minio.PutObjectOptions{ContentType: "application/octet-stream"})
+	if err != nil {
+		return err
+	}
+	fmt.Println(info)
+	return nil
+}

@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/gorilla/mux"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/minio/pkg/env"
@@ -44,10 +45,13 @@ func main() {
 		log.Fatalf("unable to create s3 client; %v", err)
 	}
 
-	mux := http.NewServeMux()
-	mux.Handle("/updatequota", auth(http.HandlerFunc(updateQuotaHandler)))
+	router := mux.NewRouter()
 
-	if err := http.ListenAndServe(address, mux); err != nil {
+	router.Handle("/quota/update", auth(http.HandlerFunc(updateQuotaHandler))).Methods("POST")
+	router.Handle("/quota/check/{user}", auth(http.HandlerFunc(quotaCheckHandler))).Methods("GET")
+	router.Handle("/quota/refresh", auth(http.HandlerFunc(quotaRefreshHandler)))
+
+	if err := http.ListenAndServe(address, router); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -59,10 +63,6 @@ func auth(h http.Handler) http.Handler {
 				http.Error(w, "authorization header missing", http.StatusBadRequest)
 				return
 			}
-		}
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
 		}
 		h.ServeHTTP(w, r)
 	})
