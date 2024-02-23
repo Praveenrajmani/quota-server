@@ -24,26 +24,26 @@ import (
 func updateQuotaHandler(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		log.Printf("[ERROR] unable to read the body; %v\n", err)
+		fmt.Printf("[ERROR] unable to read the body; %v\n", err)
 		http.Error(w, "error reading response body", http.StatusBadRequest)
 		return
 	}
 	var jsonData map[string]interface{}
 	if err = json.Unmarshal(body, &jsonData); err != nil {
-		log.Printf("[ERROR] unable to unmarshal the body; %v\n", err)
+		fmt.Printf("[ERROR] unable to unmarshal the body; %v\n", err)
 		http.Error(w, "error marshalling response body", http.StatusBadRequest)
 		return
 	}
 	records, ok := jsonData["Records"].([]interface{})
 	if !ok || len(records) == 0 {
-		log.Println("[ERROR] missing records in the request body")
+		fmt.Println("[ERROR] missing records in the request body")
 		http.Error(w, "missing records in the request body", http.StatusBadRequest)
 		return
 	}
 	record := records[0].(map[string]interface{})
 	s3Data, ok := record["s3"].(map[string]interface{})
 	if !ok {
-		log.Println("[ERROR] missing records in the request body")
+		fmt.Println("[ERROR] missing records in the request body")
 		http.Error(w, "missing s3 data in the request body", http.StatusBadRequest)
 		return
 	}
@@ -62,18 +62,30 @@ func updateQuotaHandler(w http.ResponseWriter, r *http.Request) {
 
 	path, err := url.PathUnescape(object)
 	if err != nil {
-		fmt.Printf("[ERROR] unable to escape the path %v; %v\n", object, err)
+		fmt.Printf("[ERROR] unable to escape the path '%v'; %v\n", object, err)
 		http.Error(w, "unable to escape the object path", http.StatusBadRequest)
 		return
 	}
 
 	tokens := strings.Split(path, "/")
 	if len(tokens) < 3 {
-		fmt.Println("[ERROR] invalid path %v", path)
+		fmt.Printf("[ERROR] invalid path '%v'\n", path)
 		http.Error(w, "invalid path", http.StatusBadRequest)
 		return
 	}
+	date := tokens[0]
 	user := tokens[1]
+
+	t, err := time.Parse(dateFormat, date)
+	if err != nil {
+		fmt.Printf("[ERROR] unable to parse the date '%v' in the '%v'; %v\n", date, path, err)
+		http.Error(w, "invalid path", http.StatusBadRequest)
+	}
+	if getCurrentDateInUTC().After(t.UTC()) {
+		fmt.Printf("[ERROR] unable to update the quota; the date found in the path '%v' is older than the current date\n", path)
+		// purposefully sending 200 OK because we don't want such events to be retried
+		return
+	}
 
 	lock(user)
 	defer unlock(user)
@@ -82,7 +94,7 @@ func updateQuotaHandler(w http.ResponseWriter, r *http.Request) {
 	userQuota, err = readUserQuota(context.Background(), user)
 	if err != nil {
 		if minio.ToErrorResponse(err).Code != "NoSuchKey" {
-			fmt.Printf("[ERROR] unable to GET the manifest for user %v; %v\n", user, err)
+			fmt.Printf("[ERROR] unable to GET the manifest for user '%v'; %v\n", user, err)
 			http.Error(w, "manifest file cannot be read", http.StatusBadRequest)
 			return
 		}
@@ -97,18 +109,18 @@ func updateQuotaHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if len(userQuota.Objects) >= userQuota.MaxLimit {
-		fmt.Printf("[WARNING] unable to update quota; max limit exceeded for user %v\n", user)
+	if len(userQuota.Objects) > userQuota.MaxLimit {
+		fmt.Printf("[WARNING] unable to update quota; max limit exceeded for user '%v'\n", user)
 		http.Error(w, "max limit exceeded", http.StatusForbidden)
 		return
 	}
 
 	if err := updateUserQuota(context.Background(), user, userQuota); err != nil {
-		fmt.Printf("unable to update user quota for user %v; %v\n", user, err)
+		fmt.Printf("unable to update user quota for user '%v'; %v\n", user, err)
 		http.Error(w, "unable to update user quota", http.StatusBadRequest)
 	}
 
-	fmt.Printf("[LOG] updated quota for %v\n", user)
+	fmt.Printf("[LOG] updated quota for '%v'\n", user)
 }
 
 // GET /quota/check/{user}
@@ -151,20 +163,20 @@ func quotaRefreshHandler(w http.ResponseWriter, r *http.Request) {
 
 		userQuota, err := readUserQuota(context.Background(), user)
 		if err != nil {
-			fmt.Printf("[ERROR] unable to read user quota for user %v; %v\n", user, err)
-			return fmt.Errorf("unable to read user quota for user %v; %v\n", user, err)
+			fmt.Printf("[ERROR] unable to read user quota for user '%v'; %v\n", user, err)
+			return fmt.Errorf("unable to read user quota for user '%v'; %v\n", user, err)
 		}
 		if userQuota.Refresh() {
 			if err := updateUserQuota(context.Background(), user, userQuota); err != nil {
-				fmt.Printf("[ERROR] unable to update user quota for user %v; %v\n", user, err)
-				return fmt.Errorf("unable to update user quota for user %v; %v\n", user, err)
+				fmt.Printf("[ERROR] unable to update user quota for user '%v'; %v\n", user, err)
+				return fmt.Errorf("unable to update user quota for user '%v'; %v\n", user, err)
 			}
 		}
 		return nil
 	}
 	for object := range s3Client.ListObjects(context.Background(), quotaBucket, minio.ListObjectsOptions{}) {
 		if object.Err != nil {
-			fmt.Printf("[ERROR] unable to list objects from %v bucket; %v\n", quotaBucket, object.Err)
+			fmt.Printf("[ERROR] unable to list objects from '%v' bucket; %v\n", quotaBucket, object.Err)
 			http.Error(w, fmt.Sprintf("unable to list objects; %v", object.Err), http.StatusInternalServerError)
 			return
 		}
@@ -174,12 +186,12 @@ func quotaRefreshHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		fmt.Printf("[LOG] refreshed quota for %v\n", user)
+		fmt.Printf("[LOG] refreshed quota for user '%v'\n", user)
 	}
 	return
 }
 
-// GET /purge
+// DELETE /purge
 //
 // - Lists all the voice mails
 // - Checks if the objects fall behind the current time
@@ -188,24 +200,24 @@ func quotaRefreshHandler(w http.ResponseWriter, r *http.Request) {
 func purgeHandler(w http.ResponseWriter, r *http.Request) {
 	for object := range s3Client.ListObjects(context.Background(), dataBucket, minio.ListObjectsOptions{}) {
 		if object.Err != nil {
-			fmt.Printf("[ERROR] unable to list objects from %v bucket; %v\n", dataBucket, object.Err)
+			fmt.Printf("[ERROR] unable to list objects from '%v' bucket; %v\n", dataBucket, object.Err)
 			http.Error(w, fmt.Sprintf("unable to list objects; %v", object.Err), http.StatusInternalServerError)
 			return
 		}
 		key := strings.TrimSuffix(object.Key, "/")
 		t, err := time.Parse(dateFormat, key)
 		if err != nil {
-			fmt.Printf("[ERROR] unable to parse key %v; %v\n", key, err)
+			fmt.Printf("[ERROR] unable to parse key '%v'; %v\n", key, err)
 			continue
 		}
 		if getCurrentDateInUTC().After(t.UTC()) {
 			if err := s3Client.RemoveObject(context.Background(), dataBucket, key, minio.RemoveObjectOptions{
 				ForceDelete: true,
 			}); err != nil {
-				fmt.Printf("[ERROR] unable to delete the object from source: %v/%v; %v\n", dataBucket, key, err)
+				fmt.Printf("[ERROR] unable to delete the object from source: '%v/%v'; %v\n", dataBucket, key, err)
 				continue
 			}
-			fmt.Printf("[LOG] purged %v/%v\n", dataBucket, key)
+			fmt.Printf("[LOG] purged '%v/%v'\n", dataBucket, key)
 		}
 	}
 }

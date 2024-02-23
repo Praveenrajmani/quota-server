@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -25,12 +26,19 @@ var (
 	quotaBucket = env.Get("QUOTA_BUCKET", "")
 	s3Client    *minio.Client
 	dryRun      bool
+	maxLimit    int
 )
 
 func main() {
 	flag.StringVar(&address, "address", ":8080", "bind to a specific ADDRESS:PORT, ADDRESS can be an IP or hostname")
 	flag.BoolVar(&dryRun, "dry-run", false, "Enable dry run mode")
 	flag.Parse()
+
+	var err error
+	maxLimit, err = env.GetInt("MAX_OBJECT_LIMIT_PER_USER", 0)
+	if err != nil {
+		log.Fatalf("unable to read MAX_OBJECT_LIMIT_PER_USER env; %v", err)
+	}
 
 	if endpoint == "" {
 		log.Fatal("MINIO_ENDPOINT env is not set")
@@ -47,11 +55,29 @@ func main() {
 	if quotaBucket == "" {
 		log.Fatal("QUOTA_BUCKET env is not set")
 	}
+	if maxLimit <= 0 {
+		log.Fatalf("MAX_OBJECT_LIMIT_PER_USER env is not set")
+	}
 
-	var err error
 	s3Client, err = getS3Client(endpoint, accessKey, secretKey, insecure)
 	if err != nil {
 		log.Fatalf("unable to create s3 client; %v", err)
+	}
+
+	found, err := s3Client.BucketExists(context.Background(), dataBucket)
+	if err != nil {
+		log.Fatalf("unable to stat the bucket %v; %v", dataBucket, err)
+	}
+	if !found {
+		log.Fatalf("DATA_BUCKET %v does not exist", dataBucket)
+	}
+
+	found, err = s3Client.BucketExists(context.Background(), quotaBucket)
+	if err != nil {
+		log.Fatalf("unable to stat the bucket %v; %v", quotaBucket, err)
+	}
+	if !found {
+		log.Fatalf("QUOTA_BUCKET %v does not exist", quotaBucket)
 	}
 
 	router := mux.NewRouter()
@@ -59,10 +85,15 @@ func main() {
 	router.Handle("/quota/update", auth(http.HandlerFunc(updateQuotaHandler))).Methods("POST")
 	router.Handle("/quota/check/{user}", auth(http.HandlerFunc(quotaCheckHandler))).Methods("GET")
 	router.Handle("/quota/refresh", auth(http.HandlerFunc(quotaRefreshHandler)))
-	router.Handle("/purge", auth(http.HandlerFunc(purgeHandler)))
+	router.Handle("/purge", auth(http.HandlerFunc(purgeHandler))).Methods("DELETE")
 
 	fmt.Printf("MinIO endpoint configuired: %v\n", endpoint)
+	fmt.Printf("Configured data bucket: %v\n", dataBucket)
+	fmt.Printf("Configured quota bucket: %v\n", quotaBucket)
+	fmt.Printf("Configured max limit per user: %v\n", maxLimit)
+	fmt.Println()
 	fmt.Printf("Listening on %v ...\n", address)
+	fmt.Println()
 
 	if err := http.ListenAndServe(address, router); err != nil {
 		log.Fatal(err)

@@ -12,10 +12,8 @@ import (
 )
 
 const (
-	maxLimit   = 10
 	dateFormat = "2006-Jan-02"
-
-	quotaExt = ".quota"
+	quotaExt   = ".quota"
 )
 
 // UserQuota represents the user quota
