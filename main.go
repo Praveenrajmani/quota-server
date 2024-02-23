@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"net/url"
@@ -14,14 +15,16 @@ import (
 )
 
 var (
-	address   string
-	authToken = env.Get("WEBHOOK_AUTH_TOKEN", "")
-	endpoint  = env.Get("MINIO_ENDPOINT", "")
-	accessKey = env.Get("MINIO_ACCESS_KEY", "")
-	secretKey = env.Get("MINIO_SECRET_KEY", "")
-	insecure  = env.Get("MINIO_INSECURE", "false") == "true"
-	s3Client  *minio.Client
-	dryRun    bool
+	address     string
+	authToken   = env.Get("WEBHOOK_AUTH_TOKEN", "")
+	endpoint    = env.Get("MINIO_ENDPOINT", "")
+	accessKey   = env.Get("MINIO_ACCESS_KEY", "")
+	secretKey   = env.Get("MINIO_SECRET_KEY", "")
+	insecure    = env.Get("MINIO_INSECURE", "false") == "true"
+	dataBucket  = env.Get("DATA_BUCKET", "")
+	quotaBucket = env.Get("QUOTA_BUCKET", "")
+	s3Client    *minio.Client
+	dryRun      bool
 )
 
 func main() {
@@ -38,6 +41,12 @@ func main() {
 	if secretKey == "" {
 		log.Fatal("MINIO_SECRET_KEY env is not set")
 	}
+	if dataBucket == "" {
+		log.Fatal("DATA_BUCKET env is not set")
+	}
+	if quotaBucket == "" {
+		log.Fatal("QUOTA_BUCKET env is not set")
+	}
 
 	var err error
 	s3Client, err = getS3Client(endpoint, accessKey, secretKey, insecure)
@@ -51,6 +60,9 @@ func main() {
 	router.Handle("/quota/check/{user}", auth(http.HandlerFunc(quotaCheckHandler))).Methods("GET")
 	router.Handle("/quota/refresh", auth(http.HandlerFunc(quotaRefreshHandler)))
 	router.Handle("/purge", auth(http.HandlerFunc(purgeHandler)))
+
+	fmt.Printf("MinIO endpoint configuired: %v\n", endpoint)
+	fmt.Printf("Listening on %v ...\n", address)
 
 	if err := http.ListenAndServe(address, router); err != nil {
 		log.Fatal(err)

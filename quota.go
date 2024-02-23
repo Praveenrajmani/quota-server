@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"strings"
 	"time"
@@ -16,8 +15,7 @@ const (
 	maxLimit   = 10
 	dateFormat = "2006-Jan-02"
 
-	manifestsBucket = "manifests"
-	quotaExt        = ".quota"
+	quotaExt = ".quota"
 )
 
 // UserQuota represents the user quota
@@ -34,6 +32,7 @@ func NewUserQuota() *UserQuota {
 	}
 }
 
+// getCurrentDateInUTC fetches the current date in UTC format
 func getCurrentDateInUTC() time.Time {
 	currentTime := time.Now().UTC()
 	return time.Date(currentTime.Year(), currentTime.Month(), currentTime.Day(), 0, 0, 0, 0, currentTime.Location())
@@ -81,7 +80,7 @@ func parseUserQuota(r io.Reader) (*UserQuota, error) {
 
 // readUserQuota GETs the user quota, reads and parses it
 func readUserQuota(ctx context.Context, user string) (*UserQuota, error) {
-	reader, err := s3Client.GetObject(ctx, manifestsBucket, user+quotaExt, minio.GetObjectOptions{})
+	reader, err := s3Client.GetObject(ctx, quotaBucket, user+quotaExt, minio.GetObjectOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -95,10 +94,6 @@ func updateUserQuota(ctx context.Context, user string, userQuota *UserQuota) err
 	if err := userQuota.Write(&buf); err != nil {
 		return err
 	}
-	info, err := s3Client.PutObject(context.Background(), manifestsBucket, user+quotaExt, bytes.NewReader(buf.Bytes()), int64(buf.Len()), minio.PutObjectOptions{ContentType: "application/octet-stream"})
-	if err != nil {
-		return err
-	}
-	fmt.Println(info)
-	return nil
+	_, err := s3Client.PutObject(context.Background(), quotaBucket, user+quotaExt, bytes.NewReader(buf.Bytes()), int64(buf.Len()), minio.PutObjectOptions{ContentType: "application/octet-stream"})
+	return err
 }
