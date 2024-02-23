@@ -34,6 +34,11 @@ func NewUserQuota() *UserQuota {
 	}
 }
 
+func getCurrentDateInUTC() time.Time {
+	currentTime := time.Now().UTC()
+	return time.Date(currentTime.Year(), currentTime.Month(), currentTime.Day(), 0, 0, 0, 0, currentTime.Location())
+}
+
 // Refresh parses the time in the path of the objects and filters them if they are stale
 func (quota *UserQuota) Refresh() (updated bool) {
 	objects := map[string]int{}
@@ -49,7 +54,7 @@ func (quota *UserQuota) Refresh() (updated bool) {
 			updated = true
 			continue
 		}
-		if time.Now().After(t) {
+		if getCurrentDateInUTC().After(t.UTC()) {
 			updated = true
 			continue
 		}

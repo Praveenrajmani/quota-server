@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/minio/minio-go/v7"
@@ -167,4 +168,32 @@ func quotaRefreshHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	return
+}
+
+// GET /purge
+//
+// - Lists all the voice mails
+// - Checks if the objects fall behind the current time
+// - If yes, force deletes them
+// NOTE: Meant to be run in a CRON-JOB periodically every day
+func purgeHandler(w http.ResponseWriter, r *http.Request) {
+	for object := range s3Client.ListObjects(context.Background(), "voicemails", minio.ListObjectsOptions{}) {
+		if object.Err != nil {
+			http.Error(w, fmt.Sprintf("unable to list objects; %v", object.Err), http.StatusInternalServerError)
+			return
+		}
+		key := strings.TrimSuffix(object.Key, "/")
+		t, err := time.Parse(dateFormat, key)
+		if err != nil {
+			fmt.Println(err)
+			continue
+		}
+		if getCurrentDateInUTC().After(t.UTC()) {
+			if err := s3Client.RemoveObject(context.Background(), "voicemails", key, minio.RemoveObjectOptions{
+				ForceDelete: true,
+			}); err != nil {
+				fmt.Printf("unable to delete the object from source: %v; %v\n", key, err)
+			}
+		}
+	}
 }

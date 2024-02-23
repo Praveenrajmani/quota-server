@@ -50,6 +50,7 @@ func main() {
 	router.Handle("/quota/update", auth(http.HandlerFunc(updateQuotaHandler))).Methods("POST")
 	router.Handle("/quota/check/{user}", auth(http.HandlerFunc(quotaCheckHandler))).Methods("GET")
 	router.Handle("/quota/refresh", auth(http.HandlerFunc(quotaRefreshHandler)))
+	router.Handle("/purge", auth(http.HandlerFunc(purgeHandler)))
 
 	if err := http.ListenAndServe(address, router); err != nil {
 		log.Fatal(err)
