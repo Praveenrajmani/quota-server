@@ -53,11 +53,14 @@ func main() {
 		endpoint := env.Get("MINIO_ENDPOINT_"+targetName, "")
 		accessKey := env.Get("MINIO_ACCESS_"+targetName, "")
 		secretKey := env.Get("MINIO_SECRET_"+targetName, "")
+		if endpoint == "" {
+			log.Fatalf("MINIO_ENDPOINT_%v is empty", targetName)
+		}
 		if accessKey == "" {
 			log.Fatalf("MINIO_ACCESS_%v is not set", targetName)
 		}
 		if secretKey == "" {
-			log.Fatal("MINIO_SECRET_%v is not set", targetName)
+			log.Fatalf("MINIO_SECRET_%v is not set", targetName)
 		}
 		insecure := env.Get("MINIO_INSECURE_"+targetName, strconv.FormatBool(insecure)) == "true"
 		s3Client, err := getS3Client(endpoint, accessKey, secretKey, insecure)

@@ -11,13 +11,19 @@ Usage of ./quota-server:
 ### Example
 
 ```sh
-> export MINIO_ACCESS_KEY=minio
-> export MINIO_SECRET_KEY=minio123
+> export MAX_OBJECT_LIMIT_PER_USER=10
 > export DATA_BUCKET=voicemails
 > export QUOTA_BUCKET=manifests
 > export MAX_OBJECT_LIMIT_PER_USER=10
+> export MINIO_ENDPOINT_site1=http://127.0.0.1:9000
+> export MINIO_ACCESS_site1=minio
+> export MINIO_SECRET_site1=minio123
+> export MINIO_ENDPOINT_site2=http://127.0.0.1:9002
+> export MINIO_ACCESS_site2=minio
+> export MINIO_SECRET_site2=minio123
 > ./quota-server
-MinIO endpoint configuired: http://127.0.0.1:9000
+Configured MinIO Site: 127.0.0.1:9000
+Configured MinIO Site: 127.0.0.1:9002
 Configured data bucket: voicemails
 Configured quota bucket: manifests
 Configured max limit per user: 10
@@ -41,7 +47,7 @@ POST /quota/update
 Here is an example to configure this endpoint for a PUT event,
 
 ```sh
-> mc admin config set myminio notify_webhook:1 enable=on endpoint=http://127.0.0.1:8080/quota/update
+> mc admin config set myminio notify_webhook:1 enable=on endpoint=http://127.0.0.1:8080/quota/update queue_dir=/tmp/events
 Successfully applied new settings.
 Please restart your server 'mc admin service restart myminio'.
 > mc admin service restart myminio --insecure                                                       
@@ -57,6 +63,7 @@ Restarted `myminio` successfully in 503 milliseconds
 > mc event add myminio/voicemails arn:minio:sqs::1:webhook --event put
 Successfully added arn:minio:sqs::1:webhook
 ```
+(NOTE: Configure the same on the other sites as well)
 
 #### Check Quota
 

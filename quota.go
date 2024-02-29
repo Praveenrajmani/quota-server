@@ -21,14 +21,14 @@ const (
 
 // UserQuota represents the user quota
 type UserQuota struct {
-	Objects  map[string]int `json:"objects"`
-	MaxLimit int            `json:"maxLimit,omitempty"`
+	Objects  map[string]struct{} `json:"objects"`
+	MaxLimit int                 `json:"maxLimit,omitempty"`
 }
 
 // NewUserQuota returns a new user quota
 func NewUserQuota() *UserQuota {
 	return &UserQuota{
-		Objects:  make(map[string]int),
+		Objects:  make(map[string]struct{}),
 		MaxLimit: maxLimit,
 	}
 }
@@ -41,8 +41,8 @@ func getCurrentDateInUTC() time.Time {
 
 // Refresh parses the time in the path of the objects and filters them if they are stale
 func (quota *UserQuota) Refresh() (updated bool) {
-	objects := map[string]int{}
-	for object, version := range quota.Objects {
+	objects := map[string]struct{}{}
+	for object, _ := range quota.Objects {
 		tokens := strings.Split(object, "/")
 		if len(tokens) < 3 {
 			updated = true
@@ -58,7 +58,7 @@ func (quota *UserQuota) Refresh() (updated bool) {
 			updated = true
 			continue
 		}
-		objects[object] = version
+		objects[object] = struct{}{}
 	}
 	quota.Objects = objects
 	return
@@ -80,25 +80,43 @@ func parseUserQuota(r io.Reader) (*UserQuota, error) {
 }
 
 // readUserQuota GETs the user quota, reads and parses it
-func readUserQuota(ctx context.Context, s3Client *minio.Client, user string) (*UserQuota, error) {
+func readUserQuota(ctx context.Context, s3Client *minio.Client, user string) (*UserQuota, string, error) {
 	reader, err := s3Client.GetObject(ctx, quotaBucket, user+quotaExt, minio.GetObjectOptions{})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer reader.Close()
-	return parseUserQuota(reader)
+
+	stat, err := reader.Stat()
+	if err != nil {
+		return nil, "", err
+	}
+	etag := stat.ETag
+	userQuota, err := parseUserQuota(reader)
+	return userQuota, etag, err
 }
 
 // updateUserQuota PUTs the provided user quota to MinIO
-func updateUserQuota(ctx context.Context, s3Client *minio.Client, user string, userQuota *UserQuota) error {
+func updateUserQuota(ctx context.Context, s3Client *minio.Client, user string, userQuota *UserQuota, etag string) error {
 	var buf bytes.Buffer
 	if err := userQuota.Write(&buf); err != nil {
 		return err
 	}
-	_, err := s3Client.PutObject(context.Background(), quotaBucket, user+quotaExt, bytes.NewReader(buf.Bytes()), int64(buf.Len()), minio.PutObjectOptions{ContentType: "application/octet-stream"})
+	_, err := s3Client.PutObject(ctx,
+		quotaBucket,
+		user+quotaExt,
+		bytes.NewReader(buf.Bytes()),
+		int64(buf.Len()),
+		minio.PutObjectOptions{
+			ContentType: "application/octet-stream",
+			Internal: minio.AdvancedPutOptions{
+				SourceETag: etag,
+			},
+		})
 	return err
 }
 
+// updateQuota updates the quota on all the s3clients configured
 func updateQuota(ctx context.Context, user, path string) error {
 	g := errgroup.WithNErrs(len(s3Clients))
 	for index := range s3Clients {
@@ -107,28 +125,33 @@ func updateQuota(ctx context.Context, user, path string) error {
 			if s3Clients[index] == nil {
 				return errors.New("s3Client is nil")
 			}
-			userQuota, err := readUserQuota(ctx, s3Clients[index], user)
+			userQuota, etag, err := readUserQuota(ctx, s3Clients[index], user)
 			if err != nil {
 				if minio.ToErrorResponse(err).Code != "NoSuchKey" {
-					fmt.Printf("[ERROR] unable to GET the manifest for user '%v'; %v\n", user, err)
+					fmt.Printf("[ERROR][%v] unable to GET the manifest for user '%v'; %v\n", s3Clients[index].EndpointURL().Host, user, err)
 					return fmt.Errorf("user quota cannot be read; %v", err)
 				}
 				userQuota = NewUserQuota()
-				userQuota.Objects[path] = 1
+				userQuota.Objects[path] = struct{}{}
 			} else {
+				if etag == "" {
+					fmt.Printf("[ERROR][%v] ETag not returned for user quota; user: '%v';", s3Clients[index].EndpointURL().Host, user)
+					return fmt.Errorf("ETag not found in object; %v", err)
+				}
 				userQuota.Refresh()
 				if _, ok := userQuota.Objects[path]; ok {
-					userQuota.Objects[path]++
+					// Already appended
+					return nil
 				} else {
-					userQuota.Objects[path] = 1
+					userQuota.Objects[path] = struct{}{}
 				}
 			}
 			if len(userQuota.Objects) > userQuota.MaxLimit {
-				fmt.Printf("[WARNING] unable to update quota; max limit exceeded for user '%v'\n", user)
+				fmt.Printf("[WARNING][%v] unable to update quota; max limit exceeded for user '%v'\n", s3Clients[index].EndpointURL().Host, user)
 				return errMaxLimitExceeded
 			}
-			if err := updateUserQuota(ctx, s3Clients[index], user, userQuota); err != nil {
-				fmt.Printf("[ERROR] unable to update user quota for user '%v'; %v\n", user, err)
+			if err := updateUserQuota(ctx, s3Clients[index], user, userQuota, etag); err != nil {
+				fmt.Printf("[ERROR][%v] unable to update user quota for user '%v'; %v\n", s3Clients[index].EndpointURL().Host, user, err)
 				return fmt.Errorf("unable to update user quota for user: %v; %v", user, err)
 			}
 			return nil
@@ -137,6 +160,7 @@ func updateQuota(ctx context.Context, user, path string) error {
 	return g.WaitErr()
 }
 
+// checkQuota asks the s3clients to know if the userquota exceeded or not
 func checkQuota(ctx context.Context, user string) error {
 	g := errgroup.WithNErrs(len(s3Clients))
 	for index := range s3Clients {
@@ -145,7 +169,7 @@ func checkQuota(ctx context.Context, user string) error {
 			if s3Clients[index] == nil {
 				return errors.New("s3Client is nil")
 			}
-			userQuota, err := readUserQuota(ctx, s3Clients[index], user)
+			userQuota, _, err := readUserQuota(ctx, s3Clients[index], user)
 			if err != nil {
 				if minio.ToErrorResponse(err).Code != "NoSuchKey" {
 					// new user
@@ -172,15 +196,20 @@ func checkQuota(ctx context.Context, user string) error {
 	return finalErr
 }
 
+// refreshQuota lists and refreshes the quota on all the s3clients configured
 func refreshQuota(ctx context.Context) error {
 	refreshUserQuota := func(s3Client *minio.Client, user string) error {
-		userQuota, err := readUserQuota(ctx, s3Client, user)
+		userQuota, etag, err := readUserQuota(ctx, s3Client, user)
 		if err != nil {
 			fmt.Printf("[ERROR] unable to read user quota for user '%v'; %v\n", user, err)
 			return fmt.Errorf("unable to read user quota for user '%v'; %v\n", user, err)
 		}
+		if etag == "" {
+			fmt.Printf("[ERROR] ETag not returned for user quota; user: '%v';", user)
+			return fmt.Errorf("ETag not found in object; %v", err)
+		}
 		if userQuota.Refresh() {
-			if err := updateUserQuota(ctx, s3Client, user, userQuota); err != nil {
+			if err := updateUserQuota(ctx, s3Client, user, userQuota, etag); err != nil {
 				fmt.Printf("[ERROR] unable to update user quota for user '%v'; %v\n", user, err)
 				return fmt.Errorf("unable to update user quota for user '%v'; %v\n", user, err)
 			}
@@ -214,6 +243,7 @@ func refreshQuota(ctx context.Context) error {
 	return g.WaitErr()
 }
 
+// purge purges expired data objects on all the configured s3 clients
 func purge(ctx context.Context) error {
 	g := errgroup.WithNErrs(len(s3Clients))
 	for index := range s3Clients {
