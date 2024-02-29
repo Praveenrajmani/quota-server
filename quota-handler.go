@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -12,7 +13,10 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
-	"github.com/minio/minio-go/v7"
+)
+
+var (
+	errMaxLimitExceeded = errors.New("max limit exceeded")
 )
 
 // POST /quota/update
@@ -86,40 +90,10 @@ func updateQuotaHandler(w http.ResponseWriter, r *http.Request) {
 		// purposefully sending 200 OK because we don't want such events to be retried
 		return
 	}
-
-	lock(user)
-	defer unlock(user)
-
-	var userQuota *UserQuota
-	userQuota, err = readUserQuota(context.Background(), user)
-	if err != nil {
-		if minio.ToErrorResponse(err).Code != "NoSuchKey" {
-			fmt.Printf("[ERROR] unable to GET the manifest for user '%v'; %v\n", user, err)
-			http.Error(w, "manifest file cannot be read", http.StatusBadRequest)
-			return
-		}
-		userQuota = NewUserQuota()
-		userQuota.Objects[path] = 1
-	} else {
-		userQuota.Refresh()
-		if _, ok := userQuota.Objects[path]; ok {
-			userQuota.Objects[path]++
-		} else {
-			userQuota.Objects[path] = 1
-		}
-	}
-
-	if len(userQuota.Objects) > userQuota.MaxLimit {
-		fmt.Printf("[WARNING] unable to update quota; max limit exceeded for user '%v'\n", user)
-		http.Error(w, "max limit exceeded", http.StatusForbidden)
+	if err := updateQuota(context.Background(), user, path); err != nil {
+		http.Error(w, fmt.Sprintf("unable to update quota; %v", err), http.StatusBadRequest)
 		return
 	}
-
-	if err := updateUserQuota(context.Background(), user, userQuota); err != nil {
-		fmt.Printf("unable to update user quota for user '%v'; %v\n", user, err)
-		http.Error(w, "unable to update user quota", http.StatusBadRequest)
-	}
-
 	fmt.Printf("[LOG] updated quota for '%v'\n", user)
 }
 
@@ -132,22 +106,13 @@ func quotaCheckHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	user := vars["user"]
 
-	lock(user)
-	defer unlock(user)
-
-	userQuota, err := readUserQuota(context.Background(), user)
-	if err != nil {
-		if minio.ToErrorResponse(err).Code != "NoSuchKey" {
-			// new user
-			return
+	if err := checkQuota(context.Background(), user); err != nil {
+		if errors.Is(err, errMaxLimitExceeded) {
+			http.Error(w, err.Error(), http.StatusForbidden)
+		} else {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
-		http.Error(w, "unable to GET user quota", http.StatusInternalServerError)
 		return
-	}
-	userQuota.Refresh()
-
-	if len(userQuota.Objects) >= userQuota.MaxLimit {
-		http.Error(w, "max limit exceeded", http.StatusForbidden)
 	}
 }
 
@@ -157,38 +122,10 @@ func quotaCheckHandler(w http.ResponseWriter, r *http.Request) {
 // - Refreshes the user quota
 // - PUTs the updated user quota back to MinIO
 func quotaRefreshHandler(w http.ResponseWriter, r *http.Request) {
-	refreshUserQuota := func(user string) error {
-		lock(user)
-		defer unlock(user)
-
-		userQuota, err := readUserQuota(context.Background(), user)
-		if err != nil {
-			fmt.Printf("[ERROR] unable to read user quota for user '%v'; %v\n", user, err)
-			return fmt.Errorf("unable to read user quota for user '%v'; %v\n", user, err)
-		}
-		if userQuota.Refresh() {
-			if err := updateUserQuota(context.Background(), user, userQuota); err != nil {
-				fmt.Printf("[ERROR] unable to update user quota for user '%v'; %v\n", user, err)
-				return fmt.Errorf("unable to update user quota for user '%v'; %v\n", user, err)
-			}
-		}
-		return nil
+	if err := refreshQuota(context.Background()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
-	for object := range s3Client.ListObjects(context.Background(), quotaBucket, minio.ListObjectsOptions{}) {
-		if object.Err != nil {
-			fmt.Printf("[ERROR] unable to list objects from '%v' bucket; %v\n", quotaBucket, object.Err)
-			http.Error(w, fmt.Sprintf("unable to list objects; %v", object.Err), http.StatusInternalServerError)
-			return
-		}
-		user := strings.TrimSuffix(object.Key, quotaExt)
-		if err := refreshUserQuota(user); err != nil {
-			fmt.Println("[ERROR] " + err.Error())
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		fmt.Printf("[LOG] refreshed quota for user '%v'\n", user)
-	}
-	return
 }
 
 // DELETE /purge
@@ -198,26 +135,8 @@ func quotaRefreshHandler(w http.ResponseWriter, r *http.Request) {
 // - If yes, force deletes them
 // NOTE: Meant to be run in a CRON-JOB periodically every day
 func purgeHandler(w http.ResponseWriter, r *http.Request) {
-	for object := range s3Client.ListObjects(context.Background(), dataBucket, minio.ListObjectsOptions{}) {
-		if object.Err != nil {
-			fmt.Printf("[ERROR] unable to list objects from '%v' bucket; %v\n", dataBucket, object.Err)
-			http.Error(w, fmt.Sprintf("unable to list objects; %v", object.Err), http.StatusInternalServerError)
-			return
-		}
-		key := strings.TrimSuffix(object.Key, "/")
-		t, err := time.Parse(dateFormat, key)
-		if err != nil {
-			fmt.Printf("[ERROR] unable to parse key '%v'; %v\n", key, err)
-			continue
-		}
-		if getCurrentDateInUTC().After(t.UTC()) {
-			if err := s3Client.RemoveObject(context.Background(), dataBucket, key, minio.RemoveObjectOptions{
-				ForceDelete: true,
-			}); err != nil {
-				fmt.Printf("[ERROR] unable to delete the object from source: '%v/%v'; %v\n", dataBucket, key, err)
-				continue
-			}
-			fmt.Printf("[LOG] purged '%v/%v'\n", dataBucket, key)
-		}
+	if err := purge(context.Background()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 }

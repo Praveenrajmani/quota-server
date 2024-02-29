@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/gorilla/mux"
@@ -18,13 +19,10 @@ import (
 var (
 	address     string
 	authToken   = env.Get("WEBHOOK_AUTH_TOKEN", "")
-	endpoint    = env.Get("MINIO_ENDPOINT", "")
-	accessKey   = env.Get("MINIO_ACCESS_KEY", "")
-	secretKey   = env.Get("MINIO_SECRET_KEY", "")
 	insecure    = env.Get("MINIO_INSECURE", "false") == "true"
 	dataBucket  = env.Get("DATA_BUCKET", "")
 	quotaBucket = env.Get("QUOTA_BUCKET", "")
-	s3Client    *minio.Client
+	s3Clients   []*minio.Client
 	dryRun      bool
 	maxLimit    int
 )
@@ -39,16 +37,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("unable to read MAX_OBJECT_LIMIT_PER_USER env; %v", err)
 	}
-
-	if endpoint == "" {
-		log.Fatal("MINIO_ENDPOINT env is not set")
-	}
-	if accessKey == "" {
-		log.Fatal("MINIO_ACCESS_KEY env is not set")
-	}
-	if secretKey == "" {
-		log.Fatal("MINIO_SECRET_KEY env is not set")
-	}
 	if dataBucket == "" {
 		log.Fatal("DATA_BUCKET env is not set")
 	}
@@ -59,25 +47,41 @@ func main() {
 		log.Fatalf("MAX_OBJECT_LIMIT_PER_USER env is not set")
 	}
 
-	s3Client, err = getS3Client(endpoint, accessKey, secretKey, insecure)
-	if err != nil {
-		log.Fatalf("unable to create s3 client; %v", err)
+	envs := env.List("MINIO_ENDPOINT_")
+	for _, k := range envs {
+		targetName := strings.TrimPrefix(k, "MINIO_ENDPOINT_")
+		endpoint := env.Get("MINIO_ENDPOINT_"+targetName, "")
+		accessKey := env.Get("MINIO_ACCESS_"+targetName, "")
+		secretKey := env.Get("MINIO_SECRET_"+targetName, "")
+		if accessKey == "" {
+			log.Fatalf("MINIO_ACCESS_%v is not set", targetName)
+		}
+		if secretKey == "" {
+			log.Fatal("MINIO_SECRET_%v is not set", targetName)
+		}
+		insecure := env.Get("MINIO_INSECURE_"+targetName, strconv.FormatBool(insecure)) == "true"
+		s3Client, err := getS3Client(endpoint, accessKey, secretKey, insecure)
+		if err != nil {
+			log.Fatalf("unable to create s3 client for site %v; %v", targetName, err)
+		}
+		found, err := s3Client.BucketExists(context.Background(), dataBucket)
+		if err != nil {
+			log.Fatalf("unable to stat the bucket %v in %v; %v", dataBucket, s3Client.EndpointURL().Host, err)
+		}
+		if !found {
+			log.Fatalf("DATA_BUCKET %v does not exist in %v", dataBucket, s3Client.EndpointURL().Host)
+		}
+		found, err = s3Client.BucketExists(context.Background(), quotaBucket)
+		if err != nil {
+			log.Fatalf("unable to stat the bucket %v in %v; %v", quotaBucket, s3Client.EndpointURL().Host, err)
+		}
+		if !found {
+			log.Fatalf("QUOTA_BUCKET %v does not exist in %v", quotaBucket, s3Client.EndpointURL().Host)
+		}
+		s3Clients = append(s3Clients, s3Client)
 	}
-
-	found, err := s3Client.BucketExists(context.Background(), dataBucket)
-	if err != nil {
-		log.Fatalf("unable to stat the bucket %v; %v", dataBucket, err)
-	}
-	if !found {
-		log.Fatalf("DATA_BUCKET %v does not exist", dataBucket)
-	}
-
-	found, err = s3Client.BucketExists(context.Background(), quotaBucket)
-	if err != nil {
-		log.Fatalf("unable to stat the bucket %v; %v", quotaBucket, err)
-	}
-	if !found {
-		log.Fatalf("QUOTA_BUCKET %v does not exist", quotaBucket)
+	if len(s3Clients) == 0 {
+		log.Fatal("no MinIO sites provided")
 	}
 
 	router := mux.NewRouter()
@@ -87,7 +91,9 @@ func main() {
 	router.Handle("/quota/refresh", auth(http.HandlerFunc(quotaRefreshHandler)))
 	router.Handle("/purge", auth(http.HandlerFunc(purgeHandler))).Methods("DELETE")
 
-	fmt.Printf("MinIO endpoint configuired: %v\n", endpoint)
+	for _, s3Client := range s3Clients {
+		fmt.Printf("Configured MinIO Site: %v\n", s3Client.EndpointURL().Host)
+	}
 	fmt.Printf("Configured data bucket: %v\n", dataBucket)
 	fmt.Printf("Configured quota bucket: %v\n", quotaBucket)
 	fmt.Printf("Configured max limit per user: %v\n", maxLimit)

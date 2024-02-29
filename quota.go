@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"time"
 
 	"github.com/minio/minio-go/v7"
+	"github.com/minio/pkg/sync/errgroup"
 )
 
 const (
@@ -77,7 +80,7 @@ func parseUserQuota(r io.Reader) (*UserQuota, error) {
 }
 
 // readUserQuota GETs the user quota, reads and parses it
-func readUserQuota(ctx context.Context, user string) (*UserQuota, error) {
+func readUserQuota(ctx context.Context, s3Client *minio.Client, user string) (*UserQuota, error) {
 	reader, err := s3Client.GetObject(ctx, quotaBucket, user+quotaExt, minio.GetObjectOptions{})
 	if err != nil {
 		return nil, err
@@ -87,11 +90,162 @@ func readUserQuota(ctx context.Context, user string) (*UserQuota, error) {
 }
 
 // updateUserQuota PUTs the provided user quota to MinIO
-func updateUserQuota(ctx context.Context, user string, userQuota *UserQuota) error {
+func updateUserQuota(ctx context.Context, s3Client *minio.Client, user string, userQuota *UserQuota) error {
 	var buf bytes.Buffer
 	if err := userQuota.Write(&buf); err != nil {
 		return err
 	}
 	_, err := s3Client.PutObject(context.Background(), quotaBucket, user+quotaExt, bytes.NewReader(buf.Bytes()), int64(buf.Len()), minio.PutObjectOptions{ContentType: "application/octet-stream"})
 	return err
+}
+
+func updateQuota(ctx context.Context, user, path string) error {
+	g := errgroup.WithNErrs(len(s3Clients))
+	for index := range s3Clients {
+		index := index
+		g.Go(func() (err error) {
+			if s3Clients[index] == nil {
+				return errors.New("s3Client is nil")
+			}
+			userQuota, err := readUserQuota(ctx, s3Clients[index], user)
+			if err != nil {
+				if minio.ToErrorResponse(err).Code != "NoSuchKey" {
+					fmt.Printf("[ERROR] unable to GET the manifest for user '%v'; %v\n", user, err)
+					return fmt.Errorf("user quota cannot be read; %v", err)
+				}
+				userQuota = NewUserQuota()
+				userQuota.Objects[path] = 1
+			} else {
+				userQuota.Refresh()
+				if _, ok := userQuota.Objects[path]; ok {
+					userQuota.Objects[path]++
+				} else {
+					userQuota.Objects[path] = 1
+				}
+			}
+			if len(userQuota.Objects) > userQuota.MaxLimit {
+				fmt.Printf("[WARNING] unable to update quota; max limit exceeded for user '%v'\n", user)
+				return errMaxLimitExceeded
+			}
+			if err := updateUserQuota(ctx, s3Clients[index], user, userQuota); err != nil {
+				fmt.Printf("[ERROR] unable to update user quota for user '%v'; %v\n", user, err)
+				return fmt.Errorf("unable to update user quota for user: %v; %v", user, err)
+			}
+			return nil
+		}, index)
+	}
+	return g.WaitErr()
+}
+
+func checkQuota(ctx context.Context, user string) error {
+	g := errgroup.WithNErrs(len(s3Clients))
+	for index := range s3Clients {
+		index := index
+		g.Go(func() (err error) {
+			if s3Clients[index] == nil {
+				return errors.New("s3Client is nil")
+			}
+			userQuota, err := readUserQuota(ctx, s3Clients[index], user)
+			if err != nil {
+				if minio.ToErrorResponse(err).Code != "NoSuchKey" {
+					// new user
+					return nil
+				}
+				return fmt.Errorf("unable to GET user quota; %v", err)
+			}
+			userQuota.Refresh()
+			if len(userQuota.Objects) >= userQuota.MaxLimit {
+				return errMaxLimitExceeded
+			}
+			return nil
+		}, index)
+	}
+	var finalErr error
+	for _, err := range g.Wait() {
+		if err != nil {
+			if errors.Is(err, errMaxLimitExceeded) {
+				return err
+			}
+			finalErr = err
+		}
+	}
+	return finalErr
+}
+
+func refreshQuota(ctx context.Context) error {
+	refreshUserQuota := func(s3Client *minio.Client, user string) error {
+		userQuota, err := readUserQuota(ctx, s3Client, user)
+		if err != nil {
+			fmt.Printf("[ERROR] unable to read user quota for user '%v'; %v\n", user, err)
+			return fmt.Errorf("unable to read user quota for user '%v'; %v\n", user, err)
+		}
+		if userQuota.Refresh() {
+			if err := updateUserQuota(ctx, s3Client, user, userQuota); err != nil {
+				fmt.Printf("[ERROR] unable to update user quota for user '%v'; %v\n", user, err)
+				return fmt.Errorf("unable to update user quota for user '%v'; %v\n", user, err)
+			}
+		}
+		return nil
+	}
+
+	g := errgroup.WithNErrs(len(s3Clients))
+	for index := range s3Clients {
+		index := index
+		g.Go(func() (err error) {
+			if s3Clients[index] == nil {
+				return errors.New("s3Client is nil")
+			}
+			for object := range s3Clients[index].ListObjects(ctx, quotaBucket, minio.ListObjectsOptions{}) {
+				if object.Err != nil {
+					fmt.Printf("[ERROR] unable to list objects from '%v' bucket; %v\n", quotaBucket, object.Err)
+					return fmt.Errorf("unable to list objects; %v", object.Err)
+				}
+				user := strings.TrimSuffix(object.Key, quotaExt)
+				if err := refreshUserQuota(s3Clients[index], user); err != nil {
+					fmt.Println("[ERROR] " + err.Error())
+					return err
+				}
+				fmt.Printf("[LOG] refreshed quota for user '%v'\n", user)
+			}
+			return nil
+		}, index)
+	}
+
+	return g.WaitErr()
+}
+
+func purge(ctx context.Context) error {
+	g := errgroup.WithNErrs(len(s3Clients))
+	for index := range s3Clients {
+		index := index
+		g.Go(func() (err error) {
+			if s3Clients[index] == nil {
+				return errors.New("s3Client is nil")
+			}
+			for object := range s3Clients[index].ListObjects(context.Background(), dataBucket, minio.ListObjectsOptions{}) {
+				if object.Err != nil {
+					fmt.Printf("[ERROR] unable to list objects from '%v' bucket; %v\n", dataBucket, object.Err)
+					return fmt.Errorf("unable to list objects; %v", object.Err)
+				}
+				key := strings.TrimSuffix(object.Key, "/")
+				t, err := time.Parse(dateFormat, key)
+				if err != nil {
+					fmt.Printf("[ERROR] unable to parse key '%v'; %v\n", key, err)
+					continue
+				}
+				if getCurrentDateInUTC().After(t.UTC()) {
+					if err := s3Clients[index].RemoveObject(context.Background(), dataBucket, key, minio.RemoveObjectOptions{
+						ForceDelete: true,
+					}); err != nil {
+						fmt.Printf("[ERROR] unable to delete the object from source: '%v/%v'; %v\n", dataBucket, key, err)
+						continue
+					}
+					fmt.Printf("[LOG] purged '%v/%v'\n", dataBucket, key)
+				}
+			}
+			return nil
+		}, index)
+	}
+	return g.WaitErr()
+
 }
