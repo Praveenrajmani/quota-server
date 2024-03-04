@@ -15,8 +15,10 @@ import (
 )
 
 const (
-	dateFormat = "2006-Jan-02"
-	quotaExt   = ".quota"
+	dateFormat    = "2006-Jan-02"
+	quotaExt      = ".quota"
+	retryAttempts = 3
+	retryTimeout  = 3 * time.Second
 )
 
 // UserQuota represents the user quota
@@ -102,17 +104,17 @@ func updateUserQuota(ctx context.Context, s3Client *minio.Client, user string, u
 	if err := userQuota.Write(&buf); err != nil {
 		return err
 	}
+	opts := minio.PutObjectOptions{
+		ContentType: "application/octet-stream",
+	}
+	opts.SetMatchETag(etag)
+
 	_, err := s3Client.PutObject(ctx,
 		quotaBucket,
 		user+quotaExt,
 		bytes.NewReader(buf.Bytes()),
 		int64(buf.Len()),
-		minio.PutObjectOptions{
-			ContentType: "application/octet-stream",
-			Internal: minio.AdvancedPutOptions{
-				SourceETag: etag,
-			},
-		})
+		opts)
 	return err
 }
 
@@ -125,39 +127,50 @@ func updateQuota(ctx context.Context, user, path string) error {
 			if s3Clients[index] == nil {
 				return errors.New("s3Client is nil")
 			}
-			userQuota, etag, err := readUserQuota(ctx, s3Clients[index], user)
-			if err != nil {
-				if minio.ToErrorResponse(err).Code != "NoSuchKey" {
-					fmt.Printf("[ERROR][%v] unable to GET the manifest for user '%v'; %v\n", s3Clients[index].EndpointURL().Host, user, err)
-					return fmt.Errorf("user quota cannot be read; %v", err)
+			for attempts := 1; attempts <= retryAttempts; attempts++ {
+				err = updateLatestUserQuota(ctx, s3Clients[index], user, path)
+				if err == nil {
+					return
 				}
-				userQuota = NewUserQuota()
-				userQuota.Objects[path] = struct{}{}
-			} else {
-				if etag == "" {
-					fmt.Printf("[ERROR][%v] ETag not returned for user quota; user: '%v';", s3Clients[index].EndpointURL().Host, user)
-					return fmt.Errorf("ETag not found in object; %v", err)
-				}
-				userQuota.Refresh()
-				if _, ok := userQuota.Objects[path]; ok {
-					// Already appended
-					return nil
-				} else {
-					userQuota.Objects[path] = struct{}{}
-				}
+				time.Sleep(retryTimeout)
 			}
-			if len(userQuota.Objects) > userQuota.MaxLimit {
-				fmt.Printf("[WARNING][%v] unable to update quota; max limit exceeded for user '%v'\n", s3Clients[index].EndpointURL().Host, user)
-				return errMaxLimitExceeded
-			}
-			if err := updateUserQuota(ctx, s3Clients[index], user, userQuota, etag); err != nil {
-				fmt.Printf("[ERROR][%v] unable to update user quota for user '%v'; %v\n", s3Clients[index].EndpointURL().Host, user, err)
-				return fmt.Errorf("unable to update user quota for user: %v; %v", user, err)
-			}
-			return nil
+			return
 		}, index)
 	}
 	return g.WaitErr()
+}
+
+func updateLatestUserQuota(ctx context.Context, s3Client *minio.Client, user, path string) error {
+	userQuota, etag, err := readUserQuota(ctx, s3Client, user)
+	if err != nil {
+		if minio.ToErrorResponse(err).Code != "NoSuchKey" {
+			fmt.Printf("[ERROR][%v] unable to GET the manifest for user '%v'; %v\n", s3Client.EndpointURL().Host, user, err)
+			return fmt.Errorf("user quota cannot be read; %v", err)
+		}
+		userQuota = NewUserQuota()
+		userQuota.Objects[path] = struct{}{}
+	} else {
+		if etag == "" {
+			fmt.Printf("[ERROR][%v] ETag not returned for user quota; user: '%v';", s3Client.EndpointURL().Host, user)
+			return fmt.Errorf("ETag not found in object; %v", err)
+		}
+		userQuota.Refresh()
+		if _, ok := userQuota.Objects[path]; ok {
+			// Already appended
+			return nil
+		} else {
+			userQuota.Objects[path] = struct{}{}
+		}
+	}
+	if len(userQuota.Objects) > userQuota.MaxLimit {
+		fmt.Printf("[WARNING][%v] unable to update quota; max limit exceeded for user '%v'\n", s3Client.EndpointURL().Host, user)
+		return errMaxLimitExceeded
+	}
+	if err := updateUserQuota(ctx, s3Client, user, userQuota, etag); err != nil {
+		fmt.Printf("[ERROR][%v] unable to update user quota for user '%v'; %v\n", s3Client.EndpointURL().Host, user, err)
+		return fmt.Errorf("unable to update user quota for user: %v; %v", user, err)
+	}
+	return nil
 }
 
 // checkQuota asks the s3clients to know if the userquota exceeded or not
@@ -230,11 +243,16 @@ func refreshQuota(ctx context.Context) error {
 					return fmt.Errorf("unable to list objects; %v", object.Err)
 				}
 				user := strings.TrimSuffix(object.Key, quotaExt)
-				if err := refreshUserQuota(s3Clients[index], user); err != nil {
+				var err error
+				for attempts := 1; attempts <= retryAttempts; attempts++ {
+					err = refreshUserQuota(s3Clients[index], user)
+					if err == nil {
+						fmt.Printf("[LOG] refreshed quota for user '%v'\n", user)
+						break
+					}
 					fmt.Println("[ERROR] " + err.Error())
-					return err
+					time.Sleep(retryTimeout)
 				}
-				fmt.Printf("[LOG] refreshed quota for user '%v'\n", user)
 			}
 			return nil
 		}, index)
